@@ -9,8 +9,20 @@ from models import (
 from services import speech_service, ai_service, email_service
 from services.crypto_service import encrypt_payload, CryptoError
 from config import Config
+from validation import get_json_body, require_non_empty_string
 
 audio_bp = Blueprint('audio', __name__, url_prefix='/api/audio')
+
+
+def _existing_transcription_segments(recording):
+    return [{
+        'start': t.start_time,
+        'end': t.end_time,
+        'speaker': t.speaker,
+        'speaker_role': t.speaker_role,
+        'text': t.text,
+        'physics_terms': t.physics_terms.split(',') if t.physics_terms else []
+    } for t in recording.transcriptions]
 
 
 @audio_bp.route('/upload/<int:session_id>', methods=['POST'])
@@ -24,18 +36,24 @@ def upload_audio(session_id):
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
 
-    if file and Config.allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        unique_filename = f"{uuid.uuid4().hex}_{filename}"
-        upload_dir = current_app.config['UPLOAD_FOLDER']
+    original_filename = file.filename
+    if file and Config.allowed_file(original_filename):
+        safe_name = secure_filename(original_filename)
+        if not safe_name:
+            extension = original_filename.rsplit('.', 1)[1].lower()
+            safe_name = f'audio.{extension}'
+        unique_filename = f"{uuid.uuid4().hex}_{safe_name}"
+        upload_dir = os.path.abspath(current_app.config['UPLOAD_FOLDER'])
         os.makedirs(upload_dir, exist_ok=True)
-        file_path = os.path.join(upload_dir, unique_filename)
+        file_path = os.path.abspath(os.path.join(upload_dir, unique_filename))
+        if os.path.dirname(file_path) != upload_dir:
+            return jsonify({'error': 'Invalid file name'}), 400
         file.save(file_path)
 
         recording = AudioRecording(
             session_id=session_id,
             file_path=file_path,
-            file_name=filename,
+            file_name=original_filename,
             transcription_status='pending'
         )
         db.session.add(recording)
@@ -44,7 +62,7 @@ def upload_audio(session_id):
         return jsonify({
             'id': recording.id,
             'message': 'Audio uploaded successfully',
-            'file_name': filename
+            'file_name': original_filename
         }), 201
 
     return jsonify({'error': 'Invalid file type'}), 400
@@ -56,6 +74,12 @@ def transcribe_audio(recording_id):
 
     if recording.transcription_status == 'processing':
         return jsonify({'message': 'Transcription already in progress'}), 202
+
+    if recording.transcription_status == 'completed' and recording.transcriptions:
+        return jsonify({
+            'message': 'Transcription already completed',
+            'transcriptions': _existing_transcription_segments(recording)
+        }), 200
 
     recording.transcription_status = 'processing'
     db.session.commit()
@@ -155,9 +179,12 @@ def generate_summary(session_id):
         'location': detector.location
     }
 
-    summary_data = ai_service.generate_run_summary(
-        all_transcriptions, spectra, events, detector_info
-    )
+    try:
+        summary_data = ai_service.generate_run_summary(
+            all_transcriptions, spectra, events, detector_info
+        )
+    except Exception as e:
+        return jsonify({'error': f'Summary generation failed: {e}'}), 502
 
     summary = RunSummary(
         session_id=session_id,
@@ -212,12 +239,15 @@ def send_summary_email(summary_id):
         detector.name, summary_data, session.session_date
     )
 
-    summary.sent_to_team = True
-    summary.sent_at = datetime.utcnow()
+    sent_count = sum(1 for r in results if r.get('success'))
+    if sent_count > 0:
+        summary.sent_to_team = True
+        summary.sent_at = datetime.utcnow()
     db.session.commit()
 
     return jsonify({
-        'message': 'Emails sent',
+        'message': 'Emails sent' if sent_count > 0 else 'No emails delivered',
+        'sent_count': sent_count,
         'results': results
     })
 
@@ -225,8 +255,8 @@ def send_summary_email(summary_id):
 @audio_bp.route('/summaries/<int:summary_id>/encrypt', methods=['POST'])
 def encrypt_summary(summary_id):
     summary = RunSummary.query.get_or_404(summary_id)
-    payload = request.get_json()
-    plaintext = payload['plaintext']
+    payload = get_json_body()
+    plaintext = require_non_empty_string(payload, 'plaintext')
     token = encrypt_payload(plaintext, Config.TRANSMISSION_KEY)
     return jsonify({
         'summary_id': summary.id,
@@ -245,11 +275,16 @@ def full_process(session_id):
             recording.transcription_status = 'processing'
             db.session.commit()
 
-            transcription = speech_service.transcribe_audio(recording.file_path)
-            diarization = speech_service.diarize_speakers(recording.file_path)
-            combined = speech_service.combine_transcription_with_speakers(
-                transcription, diarization
-            )
+            try:
+                transcription = speech_service.transcribe_audio(recording.file_path)
+                diarization = speech_service.diarize_speakers(recording.file_path)
+                combined = speech_service.combine_transcription_with_speakers(
+                    transcription, diarization
+                )
+            except Exception as e:
+                recording.transcription_status = 'failed'
+                db.session.commit()
+                return jsonify({'error': f'Transcription failed: {e}'}), 500
 
             for seg in combined:
                 trans = Transcription(
@@ -300,9 +335,12 @@ def full_process(session_id):
         'location': detector.location
     }
 
-    summary_data = ai_service.generate_run_summary(
-        all_transcriptions, spectra, events, detector_info
-    )
+    try:
+        summary_data = ai_service.generate_run_summary(
+            all_transcriptions, spectra, events, detector_info
+        )
+    except Exception as e:
+        return jsonify({'error': f'Summary generation failed: {e}'}), 502
 
     summary = RunSummary(
         session_id=session_id,
@@ -319,14 +357,17 @@ def full_process(session_id):
         detector.name, summary_data, session.session_date
     )
 
-    summary.sent_to_team = True
-    summary.sent_at = datetime.utcnow()
+    sent_count = sum(1 for r in email_results if r.get('success'))
+    if sent_count > 0:
+        summary.sent_to_team = True
+        summary.sent_at = datetime.utcnow()
     db.session.commit()
 
     return jsonify({
         'summary_id': summary.id,
         'summary': summary_data,
         'transcriptions': all_transcriptions,
+        'sent_count': sent_count,
         'email_results': email_results,
         'message': 'Full processing completed'
     })

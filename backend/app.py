@@ -1,9 +1,10 @@
 import os
-from flask import Flask
+from flask import Flask, jsonify
 from flask_cors import CORS
 from config import Config
 from models import db
 from routes import detector_bp, audio_bp
+from validation import ValidationError
 
 
 def create_app():
@@ -21,6 +22,14 @@ def create_app():
 
     with app.app_context():
         db.create_all()
+
+    @app.errorhandler(ValidationError)
+    def handle_validation_error(err):
+        return jsonify({'error': str(err)}), 400
+
+    @app.errorhandler(404)
+    def handle_not_found(err):
+        return jsonify({'error': 'resource not found'}), 404
 
     @app.route('/api/health', methods=['GET'])
     def health_check():

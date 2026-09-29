@@ -31,6 +31,10 @@ PHYSICS_TERMS = [
 ]
 
 
+class SpeechServiceError(Exception):
+    """Whisper / pyannote 已安装且被真实调用，但推理失败。"""
+
+
 class SpeechService:
     def __init__(self):
         self.whisper_model = None
@@ -77,8 +81,7 @@ class SpeechService:
                 ]
             }
         except Exception as e:
-            print(f'Transcription error: {e}')
-            return self._mock_transcription(audio_path)
+            raise SpeechServiceError(f'Whisper transcription failed: {e}') from e
 
     def diarize_speakers(self, audio_path: str) -> List[Dict]:
         if not self.pyannote_pipeline:
@@ -95,8 +98,7 @@ class SpeechService:
                 })
             return speakers
         except Exception as e:
-            print(f'Diarization error: {e}')
-            return self._mock_diarization(audio_path)
+            raise SpeechServiceError(f'pyannote diarization failed: {e}') from e
 
     def combine_transcription_with_speakers(
         self,

@@ -9,6 +9,10 @@ except ImportError:
     OPENAI_AVAILABLE = False
 
 
+class AIServiceError(Exception):
+    """已配置 OpenAI Key 且真实调用失败（网络错误、429、鉴权失败等）。"""
+
+
 class AIService:
     def __init__(self):
         self.client = None
@@ -46,8 +50,7 @@ class AIService:
             content = response.choices[0].message.content
             return self._parse_ai_response(content)
         except Exception as e:
-            print(f'OpenAI API error: {e}')
-            return self._mock_summary(transcriptions, spectra, events, detector_info)
+            raise AIServiceError(f'OpenAI summary generation failed: {e}') from e
 
     def _build_summary_prompt(
         self,

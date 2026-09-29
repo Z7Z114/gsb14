@@ -64,6 +64,10 @@ def decrypt_payload(token: str, key: str) -> str:
 
     nonce, body, tag = blob[:16], blob[16:-32], blob[-32:]
 
+    expected_tag = hmac.new(mac_key, nonce + body, hashlib.sha256).digest()
+    if not hmac.compare_digest(expected_tag, tag):
+        raise CryptoError('integrity check failed: ciphertext tampered or wrong key')
+
     stream = _keystream(enc_key, nonce, len(body))
     plaintext = bytes(a ^ b for a, b in zip(body, stream))
     try:

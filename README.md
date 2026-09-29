@@ -137,18 +137,44 @@ cd backend && python -m pytest -q
 ### F. 不得回归
 
 15. 现有 `backend/tests/test_smoke.py` 必须继续全绿。
-## 已知问题（现象举例，不完整）
+## 变更说明
 
-- 探测器详情页的运行记录列表在会话有录音之后就打不开了（接口报 500）。
-- 运行详情页打开是空白 / 报错，浏览器控制台显示接口 404。
-- 新建探测器或录入本底谱时，只要漏传一个必填字段，接口就报 500 而不是 400；
-  负的曝光时长也能被接受。
-- 上传中文文件名的录音后，列表里显示的文件名变成了 `wav` 这样的扩展名，原始文件名丢失。
-- 同一段录音点两次「转写」，转写内容会翻倍。
-- 仪表盘的「运行次数」恒为 0，即使已经建过运行记录。
-- 录音转写中途失败（例如模型报错），页面却显示「转写完成」，内容还是模板示例。
-- 纪要邮件一封都没发出去，状态却显示「已发送」。
-- 把加密报文的校验标签改掉，系统照样能解密出内容，篡改无法被发现。
+本次修复以「行为规格」为验收标准，各问题的根因与修法如下：
+
+- 输入校验缺失（A）：各 POST 接口直接 `data['field']` 取值，body 缺失 / 非法 JSON /
+  缺字段时抛 `KeyError` / `TypeError` 变成 500，负数也未拦截。修法：新增
+  `backend/validation.py`（`get_json_body` / `require_non_empty_string` /
+  `require_number` / `optional_number`，拒绝 bool 与负数，`energy_kev` 允许 0），
+  非法输入抛 `ValidationError`，由 `app.py` 注册的错误处理器统一转为 400 JSON；
+  同时为 404 注册 JSON 错误体。
+- 会话列表 500（B4）：`has_summary` 误写成 `any(r.summary_text for r in s.recordings)`，
+  `AudioRecording` 没有 `summary_text` 属性，会话一旦有录音就 `AttributeError`。
+  修法：改为按 `RunSummary.session_id` 集合查询判断是否已有纪要。
+- 会话详情 404（B5）：`GET /api/detectors/sessions/<session_id>` 路由缺失。
+  修法：在 `detector_routes.py` 补上该路由，返回规格要求的全部字段。
+- 仪表盘运行次数恒为 0（B6）：`GET /api/detectors` 未返回 `sessions`。
+  修法：列表元素带上与详情接口一致的 `sessions` 数组（每元素独立构造）。
+- 中文文件名丢失（C8）：`secure_filename` 把 `术前讨论.wav` 清洗成 `wav` 后直接存库。
+  修法：展示用 `file_name` 保留原始文件名；落盘文件名单独做安全化
+  （`secure_filename` 为空时回退为 `audio.<ext>`，加 uuid 前缀防重名，
+  并校验最终路径不逃逸出上传目录）。
+- 转写重复插入（C9）：重复调用转写接口每次都重新插入。修法：状态为
+  `completed` 且已有转写记录时直接返回既有结果，不再重复写库。
+- 失败伪装成功（D10/D11）：`speech_service` / `ai_service` 把真实调用异常吞掉后
+  降级为 mock 模板并标成功。修法：模型 / Key 未配置时仍走 mock；一旦真实调用
+  失败则抛 `SpeechServiceError` / `AIServiceError`，转写接口记
+  `transcription_status = 'failed'` 并返回错误，摘要接口返回 502 且不落库；
+  `full-process` 做同样处理。
+- 邮件状态虚报（E12）：无论是否投递都置 `sent_to_team = True`。修法：按
+  `send_to_physics_team` 的逐收件人结果统计 `sent_count`，只有至少一封投递
+  成功才置 `true` 并写 `sent_at`，响应如实返回 `sent_count`
+  （SMTP 未配置时按 mock 投递成功计）。
+- 加密不校验完整性（E14）：`decrypt_payload` 解密前未验证 HMAC 标签。
+  修法：解密前用 `hmac.compare_digest` 校验标签，篡改密文 / 标签或密钥错误
+  一律抛 `CryptoError`。
+
+回归保障：新增 `backend/tests/test_spec.py`（18 条规格用例，在未修复实现上失败），
+原有 `backend/tests/test_smoke.py` 未改动且继续全绿。
 
 ## 技术栈
 
